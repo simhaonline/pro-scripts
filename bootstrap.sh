@@ -165,6 +165,7 @@ OPTIONS:
     --force-stage               Force run stage even if already completed
     --reset-state               Reset all stage completion state
     --show-state                Show current stage completion state
+    --debug-hostname            Debug hostname validation issues
     --skip-selinux              Skip SELinux configuration
     --skip-hostname             Skip hostname configuration
     --skip-users                Skip user creation/configuration
@@ -194,8 +195,18 @@ EXAMPLES:
     $SCRIPT_NAME --skip-hostname --skip-time-sync  # Skip hostname and time sync
     $SCRIPT_NAME --skip-kernel-modules             # Skip kernel modules loading
     $SCRIPT_NAME --skip-cockpit                    # Skip Cockpit web interface
+    $SCRIPT_NAME --debug-hostname                  # Debug hostname issues
     $SCRIPT_NAME --rollback                        # Perform rollback
     $SCRIPT_NAME --list-backups                    # List available backups
+
+HOSTNAME REQUIREMENTS:
+    - Only alphanumeric characters, hyphens (-), and dots (.) allowed
+    - Cannot start or end with hyphen or dot
+    - Cannot contain consecutive dots (..)
+    - Maximum 253 characters total
+    - Maximum 63 characters per label (between dots)
+    - Cannot be an IP address
+    - Examples: server.example.com, web01, mail-server.domain.org
 
 STAGE MODE:
     Use --stage to run only specific configuration modules:
@@ -257,6 +268,56 @@ SECURITY NOTES:
     - Cockpit access is restricted to authorized users only
 
 EOF
+}
+
+# ==== DEBUG FUNCTIONS ====
+debug_hostname() {
+    log_info "=== HOSTNAME DEBUG INFORMATION ==="
+    
+    # Current hostname detection
+    local current_hostname=$(get_current_hostname)
+    log_info "Current hostname: '$current_hostname'"
+    
+    # Show hostname from various sources
+    log_info "Hostname sources:"
+    if command -v hostnamectl >/dev/null 2>&1; then
+        log_info "  hostnamectl static: $(hostnamectl --static 2>/dev/null || echo 'N/A')"
+        log_info "  hostnamectl pretty: $(hostnamectl --pretty 2>/dev/null || echo 'N/A')"
+        log_info "  hostnamectl transient: $(hostnamectl --transient 2>/dev/null || echo 'N/A')"
+    fi
+    
+    log_info "  hostname command: $(hostname 2>/dev/null || echo 'N/A')"
+    log_info "  /etc/hostname: $(cat /etc/hostname 2>/dev/null || echo 'N/A')"
+    
+    # Test hostname validation
+    if [[ -n "$current_hostname" ]]; then
+        log_info "Testing current hostname validation:"
+        if validate_hostname "$current_hostname"; then
+            log_info "  ✓ Current hostname is valid"
+        else
+            log_info "  ✗ Current hostname is invalid"
+        fi
+    fi
+    
+    # Test provided hostname if any
+    if [[ -n "$HOSTNAME" ]]; then
+        log_info "Testing provided hostname: '$HOSTNAME'"
+        if validate_hostname "$HOSTNAME"; then
+            log_info "  ✓ Provided hostname is valid"
+        else
+            log_info "  ✗ Provided hostname is invalid"
+        fi
+    fi
+    
+    # Show hex dump of hostname for debugging
+    log_info "Current hostname hex dump: $(echo -n "$current_hostname" | od -t x1 -A n | tr -d ' ')"
+    
+    # Network information
+    log_info "Network information:"
+    log_info "  Primary IP: $(hostname -I 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+    log_info "  All IPs: $(hostname -I 2>/dev/null || echo 'N/A')"
+    
+    log_info "=== END HOSTNAME DEBUG ==="
 }
 
 show_version() {
@@ -880,23 +941,49 @@ prompt_for_credentials() {
     
     # Prompt for hostname configuration
     if [[ "$ENABLE_HOSTNAME_CONFIG" == "true" && -z "$HOSTNAME" ]]; then
-        CURRENT_HOSTNAME=$(hostname 2>/dev/null || echo "localhost")
-        echo "Current hostname: $CURRENT_HOSTNAME"
+        local current_hostname=$(get_current_hostname)
+        echo "Current hostname: $current_hostname"
         echo "Enter new hostname (FQDN recommended, e.g., server.example.com):"
+        echo "Leave empty to keep current hostname"
         echo -n "Hostname: "
         read -r new_hostname
         
         if [[ -n "$new_hostname" ]]; then
+            # Clean the input
+            new_hostname=$(echo "$new_hostname" | tr -d '\r\n\t ' | tr -cd '[:print:]')
+            
             if validate_hostname "$new_hostname"; then
                 HOSTNAME="$new_hostname"
                 log_info "Hostname set to: $HOSTNAME"
             else
-                log_error "Invalid hostname format. Keeping current hostname."
-                HOSTNAME="$CURRENT_HOSTNAME"
+                log_error "Invalid hostname format. Please check the hostname requirements:"
+                log_error "  - Only alphanumeric characters, hyphens, and dots allowed"
+                log_error "  - Cannot start or end with hyphen or dot"
+                log_error "  - Maximum 253 characters total"
+                log_error "  - Maximum 63 characters per label (between dots)"
+                echo
+                echo "Would you like to try again? [y/N]"
+                read -r retry
+                if [[ "$retry" =~ ^[Yy]$ ]]; then
+                    echo -n "Enter hostname: "
+                    read -r new_hostname
+                    new_hostname=$(echo "$new_hostname" | tr -d '\r\n\t ' | tr -cd '[:print:]')
+                    
+                    if validate_hostname "$new_hostname"; then
+                        HOSTNAME="$new_hostname"
+                        log_info "Hostname set to: $HOSTNAME"
+                    else
+                        log_error "Invalid hostname format. Keeping current hostname."
+                        HOSTNAME="$current_hostname"
+                    fi
+                else
+                    log_info "Keeping current hostname: $current_hostname"
+                    HOSTNAME="$current_hostname"
+                fi
             fi
         else
-            log_info "No hostname provided. Keeping current hostname: $CURRENT_HOSTNAME"
-            HOSTNAME="$CURRENT_HOSTNAME"
+            log_info "No hostname provided. Keeping current hostname: $current_hostname"
+            HOSTNAME="$current_hostname"
         fi
     fi
     
@@ -942,50 +1029,131 @@ prompt_for_credentials() {
 validate_hostname() {
     local hostname="$1"
     
-    # Check if hostname is empty
+    # Debug: Show what we're validating
+    log_debug "Validating hostname: '$hostname' (length: ${#hostname})"
+    
+    # Clean the hostname of potential whitespace and control characters
+    hostname=$(echo "$hostname" | tr -d '\r\n\t ' | tr -cd '[:print:]')
+    
+    # Check if hostname is empty after cleaning
     if [[ -z "$hostname" ]]; then
         log_error "Hostname cannot be empty"
         return 1
     fi
     
-    # Check hostname length (max 253 characters)
+    # Convert to lowercase for validation (hostnames are case-insensitive)
+    local lower_hostname="${hostname,,}"
+    
+    # Check hostname length (max 253 characters total)
     if [[ ${#hostname} -gt 253 ]]; then
-        log_error "Hostname is too long (max 253 characters)"
+        log_error "Hostname is too long (max 253 characters, got ${#hostname})"
+        return 1
+    fi
+    
+    # Check for minimum length
+    if [[ ${#hostname} -lt 1 ]]; then
+        log_error "Hostname is too short (minimum 1 character)"
         return 1
     fi
     
     # Check for valid characters (alphanumeric, hyphens, dots)
+    # Note: Underscores are technically not allowed in hostnames but are common
     if [[ ! "$hostname" =~ ^[a-zA-Z0-9.-]+$ ]]; then
-        log_error "Hostname contains invalid characters (only alphanumeric, hyphens, and dots allowed)"
+        log_error "Hostname contains invalid characters: '$hostname'"
+        log_error "Only alphanumeric characters, hyphens, and dots are allowed"
+        log_debug "Hostname hex dump: $(echo -n "$hostname" | od -t x1 -A n)"
         return 1
     fi
     
     # Check that hostname doesn't start or end with hyphen or dot
     if [[ "$hostname" =~ ^[-.]|[-.]$ ]]; then
-        log_error "Hostname cannot start or end with hyphen or dot"
+        log_error "Hostname cannot start or end with hyphen or dot: '$hostname'"
         return 1
     fi
     
     # Check for consecutive dots
     if [[ "$hostname" =~ \.\. ]]; then
-        log_error "Hostname cannot contain consecutive dots"
+        log_error "Hostname cannot contain consecutive dots: '$hostname'"
         return 1
     fi
     
     # Check each label (part separated by dots)
-    IFS='.' read -ra LABELS <<< "$hostname"
-    for label in "${LABELS[@]}"; do
+    local IFS='.'
+    local labels_array=($hostname)
+    local label
+    
+    for label in "${labels_array[@]}"; do
+        # Check label length (max 63 characters per label)
         if [[ ${#label} -gt 63 ]]; then
-            log_error "Hostname label '$label' is too long (max 63 characters)"
+            log_error "Hostname label '$label' is too long (max 63 characters, got ${#label})"
             return 1
         fi
+        
+        # Check label minimum length
+        if [[ ${#label} -lt 1 ]]; then
+            log_error "Hostname label cannot be empty"
+            return 1
+        fi
+        
+        # Check that label doesn't start or end with hyphen
         if [[ "$label" =~ ^-|-$ ]]; then
             log_error "Hostname label '$label' cannot start or end with hyphen"
             return 1
         fi
+        
+        # Check that label starts with alphanumeric character
+        if [[ ! "$label" =~ ^[a-zA-Z0-9] ]]; then
+            log_error "Hostname label '$label' must start with alphanumeric character"
+            return 1
+        fi
+        
+        # Check that label ends with alphanumeric character
+        if [[ ! "$label" =~ [a-zA-Z0-9]$ ]]; then
+            log_error "Hostname label '$label' must end with alphanumeric character"
+            return 1
+        fi
     done
     
+    # Additional checks for common issues
+    if [[ "$hostname" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        log_error "Hostname cannot be an IP address: '$hostname'"
+        return 1
+    fi
+    
+    # Check for localhost variations
+    if [[ "$lower_hostname" == "localhost" ]] || [[ "$lower_hostname" == "localhost.localdomain" ]]; then
+        log_warn "Using localhost as hostname is not recommended for production"
+    fi
+    
+    log_debug "Hostname validation passed: '$hostname'"
     return 0
+}
+
+# ==== IMPROVED HOSTNAME DETECTION ====
+get_current_hostname() {
+    local current_hostname=""
+    
+    # Try multiple methods to get current hostname
+    if command -v hostnamectl >/dev/null 2>&1; then
+        current_hostname=$(hostnamectl --static 2>/dev/null || echo "")
+    fi
+    
+    if [[ -z "$current_hostname" ]]; then
+        current_hostname=$(hostname 2>/dev/null || echo "")
+    fi
+    
+    if [[ -z "$current_hostname" ]] && [[ -f /etc/hostname ]]; then
+        current_hostname=$(cat /etc/hostname 2>/dev/null | tr -d '\r\n\t ' || echo "")
+    fi
+    
+    if [[ -z "$current_hostname" ]]; then
+        current_hostname="localhost"
+    fi
+    
+    # Clean the hostname
+    current_hostname=$(echo "$current_hostname" | tr -d '\r\n\t ' | tr -cd '[:print:]')
+    
+    echo "$current_hostname"
 }
 
 detect_public_ips() {
@@ -1054,8 +1222,24 @@ configure_hostname() {
     
     # Use current hostname if none provided
     if [[ -z "$HOSTNAME" ]]; then
-        HOSTNAME=$(hostname 2>/dev/null || echo "localhost")
+        HOSTNAME=$(get_current_hostname)
         log_info "No hostname provided, using current: $HOSTNAME"
+    fi
+    
+    # Clean the hostname input
+    HOSTNAME=$(echo "$HOSTNAME" | tr -d '\r\n\t ' | tr -cd '[:print:]')
+    
+    # Validate hostname
+    if ! validate_hostname "$HOSTNAME"; then
+        log_error "Invalid hostname format: '$HOSTNAME'"
+        log_info "Keeping current hostname: $(get_current_hostname)"
+        HOSTNAME=$(get_current_hostname)
+        
+        # If current hostname is also invalid, use localhost
+        if ! validate_hostname "$HOSTNAME"; then
+            log_warn "Current hostname is also invalid, using localhost"
+            HOSTNAME="localhost"
+        fi
     fi
     
     # Backup current configuration
@@ -1131,8 +1315,8 @@ EOF
     fi
     
     # Verify hostname configuration
-    sleep 1
-    local current_hostname=$(hostname 2>/dev/null || echo "unknown")
+    sleep 2
+    local current_hostname=$(get_current_hostname)
     if [[ "$current_hostname" == "$HOSTNAME" ]]; then
         log_success "Hostname successfully configured: $HOSTNAME"
     else
@@ -2698,6 +2882,10 @@ parse_arguments() {
             --show-state)
                 SHOW_STATE=true
                 shift
+                ;;
+            --debug-hostname)
+                debug_hostname
+                exit 0
                 ;;
             -H|--hostname)
                 HOSTNAME="$2"
